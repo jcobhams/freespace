@@ -1,0 +1,923 @@
+#!/usr/bin/env bash
+# freespace - clear rebuildable caches, build output and finished git worktrees.
+#
+# Dry run by default: lists what it would remove and how big it is, then totals what
+# this run would free and what turning on every option would add. Nothing is deleted
+# without --apply.
+#
+# Usage: freespace [--apply] [--only a,b] [--skip a,b] [--days N] [--project-days N]
+#                  [--min-ios N] [--include-unmerged] [--docker-all]
+#                  [--scan DIR]... [--exclude DIR]...
+#
+# Sections (all run unless --only or --skip says otherwise):
+#   claude-tmp   Claude Code session temp folders untouched for --days (default 2), and
+#                Xcode build folders idle for an hour inside newer sessions' scratchpads
+#   go-cache     go clean -cache
+#   jetbrains    caches and logs of JetBrains IDE versions a newer version replaced
+#   packages     bun, yarn, npm (and npx) and Homebrew caches; unreferenced pnpm packages
+#   node         .next, .open-next and .turbo build output; node_modules in projects
+#                untouched for --project-days (default 14), node_modules/.cache otherwise
+#   rust         target/ in Cargo projects untouched for --project-days; cargo's
+#                unpacked registry sources and git checkouts (rebuilt from its local cache)
+#   cpp          CMake, CLion (cmake-build-*) and Meson build folders in projects
+#                untouched for --project-days, never an in-source build; the ccache cache
+#   python       pip, uv, poetry, conda and pre-commit caches; __pycache__, pytest, mypy,
+#                ruff, tox and nox caches; .venv and venv in projects untouched for
+#                --project-days that have a pyproject.toml, requirements file or similar
+#   docker       Docker build cache and dangling images. --docker-all also removes
+#                images no container uses, stopped containers and unused networks.
+#                Volumes are never touched.
+#   xcode        parallel-testing simulator clones, DerivedData, unavailable simulators
+#   old-ios      iOS simulator runtimes below --min-ios, and their simulators. Only runs
+#                when you pass --min-ios.
+#   worktrees    git worktrees merged into main/master, with no uncommitted changes and
+#                no commits or checkouts for --days, plus their local branches and empty
+#                leftover worktree folders
+#
+# Searching: node, rust, cpp, python and worktrees look through every folder in your
+# home folder except hidden ones, Library, Applications, media folders, OrbStack and
+# the Go module cache, plus ~/.config/superpowers/worktrees. --scan DIR (repeatable)
+# searches only the folders you name. --exclude DIR (repeatable) skips a folder.
+#
+# A project counts as untouched when no file in it, and nothing at the top of its build
+# folder, changed in the last --project-days. Anything written in the last hour is
+# always kept, so running dev servers and builds keep their files. Setting --days or
+# --project-days to 0 drops the wait but keeps that one-hour guard. Folders under 1 MB
+# are left alone.
+#
+# Options you always want can go in ~/.config/freespace/options, one per line, such
+# as "--exclude ~/docker-data". Lines starting with # are ignored. --apply is not
+# allowed there, so a plain run is always a dry run.
+#
+# du over-reports simulator clones (APFS copies share disk blocks), so they are left
+# out of the totals, and after --apply the summary compares free space before and after.
+
+set -uo pipefail
+
+SECTIONS="claude-tmp go-cache jetbrains packages node rust cpp python docker xcode old-ios worktrees"
+APPLY=0
+DOCKER_ALL=0
+ONLY=""
+SKIP=""
+DAYS=2
+PROJECT_DAYS=14
+MIN_IOS=""
+INCLUDE_UNMERGED=0
+SCAN_DIRS=()
+SCAN_GIVEN=0
+EXCLUDES=()
+SCAN_LIST=""
+NOTES=0
+KB=0
+SIZE=""
+# What this run frees, and what each opt-in option would add in a dry run.
+TOTAL_KB=0
+EXTRA_PROJECT_KB=0
+EXTRA_DAYS_KB=0
+EXTRA_UNMERGED_KB=0
+EXTRA_DOCKER_KB=0
+EXTRA_IOS_KB=0
+EXTRA_IOS_FLAG=""
+CONFIG="${FREESPACE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/freespace/options}"
+TOOL_WORKTREES="$HOME/.config/superpowers/worktrees"
+CLAUDE_TMP="/private/tmp/claude-$(id -u)"
+[ -d "$CLAUDE_TMP" ] || CLAUDE_TMP="/tmp/claude-$(id -u)"
+trap '[ -z "$SCAN_LIST" ] || rm -f "$SCAN_LIST"' EXIT
+
+usage() {
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+  exit "${1:-0}"
+}
+
+# absolute PATH: expands a leading ~ and makes the path absolute, without a trailing slash.
+absolute() {
+  local p="$1"
+  case "$p" in
+    "~") p="$HOME" ;;
+    "~/"*) p="$HOME/${p#\~/}" ;;
+    /*) ;;
+    *) p="$PWD/$p" ;;
+  esac
+  [ "$p" = / ] || p="${p%/}"
+  printf '%s' "$p"
+}
+
+# Options from the config file come first, so the command line can override them.
+config_args=()
+if [ -f "$CONFIG" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    case "$line" in
+      "" | "#"*) continue ;;
+      --apply) echo "Ignoring --apply in $CONFIG, pass it on the command line." >&2 ;;
+      *" "*) config_args+=("${line%% *}" "$(printf '%s' "${line#* }" | sed 's/^[[:space:]]*//')") ;;
+      *) config_args+=("$line") ;;
+    esac
+  done <"$CONFIG"
+fi
+set -- ${config_args[@]+"${config_args[@]}"} "$@"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --only) ONLY="${2:?--only needs a list of sections}"; shift ;;
+    --skip) SKIP="${2:?--skip needs a list of sections}"; shift ;;
+    --days) DAYS="${2:?--days needs a number}"; shift ;;
+    --project-days) PROJECT_DAYS="${2:?--project-days needs a number}"; shift ;;
+    --min-ios) MIN_IOS="${2:?--min-ios needs a version}"; shift ;;
+    --include-unmerged) INCLUDE_UNMERGED=1 ;;
+    --docker-all) DOCKER_ALL=1 ;;
+    --scan) SCAN_DIRS+=("$(absolute "${2:?--scan needs a folder}")"); SCAN_GIVEN=1; shift ;;
+    --exclude) EXCLUDES+=("$(absolute "${2:?--exclude needs a folder}")"); shift ;;
+    -h | --help) usage 0 ;;
+    *) echo "Unknown option: $1" >&2; usage 1 ;;
+  esac
+  shift
+done
+
+for n in "$DAYS" "$PROJECT_DAYS" ${MIN_IOS:+"$MIN_IOS"}; do
+  case "$n" in
+    '' | *[!0-9]*) echo "Expected a whole number, got: $n" >&2; exit 1 ;;
+  esac
+done
+for s in $(echo "$ONLY,$SKIP" | tr ',' ' '); do
+  case " $SECTIONS " in
+    *" $s "*) ;;
+    *) echo "Unknown section: $s (choose from: $SECTIONS)" >&2; exit 1 ;;
+  esac
+done
+
+if [ "$SCAN_GIVEN" = 0 ]; then
+  for d in "$HOME"/*/; do
+    case "$(basename "$d")" in
+      Library | Applications | Movies | Music | Pictures | Public | OrbStack | snap) continue ;;
+    esac
+    SCAN_DIRS+=("${d%/}")
+  done
+  [ -d "$TOOL_WORKTREES" ] && SCAN_DIRS+=("$TOOL_WORKTREES")
+fi
+
+note() { printf '  %s\n' "$*"; NOTES=$((NOTES + 1)); }
+free_kb() { df -k "$HOME" | awk 'NR == 2 { print $4 }'; }
+human_kb() {
+  awk -v k="$1" 'BEGIN {
+    s = ""; if (k < 0) { s = "-"; k = -k }
+    split("KB MB GB TB", u, " "); i = 1
+    while (k >= 1024 && i < 4) { k /= 1024; i++ }
+    printf "%s%.1f %s", s, k, u[i]
+  }'
+}
+kb_of() { du -sk "$1" 2>/dev/null | cut -f1; }
+total_kb() { printf '%s\0' "$@" | xargs -0 du -sk 2>/dev/null | awk '{ s += $1 } END { print s + 0 }'; }
+# set_kb N: sets KB and SIZE from a number of kilobytes.
+set_kb() { KB="${1:-0}"; SIZE="$(human_kb "$KB")"; }
+# measure PATH: sets KB and SIZE to the size of PATH.
+measure() { set_kb "$([ -e "$1" ] && kb_of "$1")"; }
+# sized PATH: measures PATH, and fails when it is under 1 MB.
+sized() { measure "$1"; [ "$KB" -ge 1024 ]; }
+has_files() { [ -n "$(find "$1" -type f -print -quit 2>/dev/null)" ]; }
+tilde() { printf '%s' "${1/#$HOME/~}"; }
+
+# On a Mac without developer tools, /usr/bin/python3 opens an install dialog instead.
+have_python() {
+  local py
+  py="$(command -v python3)" || return 1
+  [ "$py" != /usr/bin/python3 ] || xcode-select -p >/dev/null 2>&1
+}
+
+wanted() {
+  if [ -n "$ONLY" ]; then
+    case ",$ONLY," in *",$1,"*) ;; *) return 1 ;; esac
+  fi
+  case ",$SKIP," in *",$1,"*) return 1 ;; esac
+  return 0
+}
+
+# section NAME TITLE FUNCTION: runs one section when it is wanted.
+section() {
+  wanted "$1" || return 0
+  printf '\n\033[1m%s\033[0m\n' "$2"
+  NOTES=0
+  "$3"
+  [ "$NOTES" != 0 ] || note "nothing to remove"
+}
+
+# run CMD...: runs it with --apply, prints it otherwise.
+run() {
+  if [ "$APPLY" = 1 ]; then
+    "$@" </dev/null
+  else
+    printf '    would run: %s\n' "$*"
+  fi
+}
+
+# remove PATH...: rm -rf with --apply, but only inside the home or Claude temp folder.
+# The line describing each path is printed by the caller.
+remove() {
+  local p
+  for p in "$@"; do
+    case "$p" in
+      "$CLAUDE_TMP"/?* | "$HOME"/?*) ;;
+      *) echo "  refusing to remove $p" >&2; continue ;;
+    esac
+    [ "$APPLY" = 1 ] && rm -rf "$p"
+  done
+  return 0
+}
+
+# take PATH [LABEL]: lists PATH with the size measured last, counts it, removes it.
+take() {
+  note "$SIZE  ${2:-$(tilde "$1")}"
+  TOTAL_KB=$((TOTAL_KB + KB))
+  remove "$1"
+}
+
+# take_cmd LABEL CMD...: lists LABEL with the size measured last, counts it, runs CMD.
+take_cmd() {
+  local label="$1"
+  shift
+  note "$SIZE  $label"
+  TOTAL_KB=$((TOTAL_KB + KB))
+  run "$@"
+}
+
+# extra OPTION KB: in a dry run, counts KB toward what OPTION would also free.
+extra() {
+  [ "$APPLY" = 0 ] || return 0
+  case "$1" in
+    project-days) EXTRA_PROJECT_KB=$((EXTRA_PROJECT_KB + $2)) ;;
+    days) EXTRA_DAYS_KB=$((EXTRA_DAYS_KB + $2)) ;;
+    include-unmerged) EXTRA_UNMERGED_KB=$((EXTRA_UNMERGED_KB + $2)) ;;
+    docker-all) EXTRA_DOCKER_KB=$((EXTRA_DOCKER_KB + $2)) ;;
+    min-ios) EXTRA_IOS_KB=$((EXTRA_IOS_KB + $2)) ;;
+  esac
+}
+
+# recently_used DIR: true when something near the top of DIR changed in the last hour.
+recently_used() { [ -n "$(find "$1" -maxdepth 2 -mmin -60 -print -quit 2>/dev/null)" ]; }
+
+# changed_within PROJECT BUILD_DIR AGE_TEST...: true when a file in the project, or
+# the top of its build folder, passes the find age test (such as -mtime -14).
+changed_within() {
+  local project="$1" build="$2"
+  shift 2
+  [ -n "$(find "$build" -maxdepth 2 "$@" -print -quit 2>/dev/null)" ] && return 0
+  [ -n "$(find "$project" \( -name .git -o -name node_modules -o -name target -o -name .next \
+    -o -name .open-next -o -name 'cmake-build-*' -o -name .venv -o -name venv \) -prune \
+    -o -type f "$@" -print -quit 2>/dev/null)" ]
+}
+
+# project_active PROJECT BUILD_DIR: changed in the last --project-days, or the last hour.
+project_active() {
+  if [ "$PROJECT_DAYS" = 0 ]; then
+    changed_within "$1" "$2" -mmin -60
+  else
+    changed_within "$1" "$2" -mtime -"$PROJECT_DAYS"
+  fi
+}
+
+# kept_project PROJECT BUILD_DIR [KB_ALREADY_COUNTED]: counts a build folder that only
+# --project-days kept toward what --project-days 0 would free.
+kept_project() {
+  [ "$APPLY" = 0 ] || return 0
+  changed_within "$1" "$2" -mmin -60 && return 0
+  measure "$2"
+  extra project-days $((KB - ${3:-0}))
+}
+
+idle_reason() {
+  if [ "$PROJECT_DAYS" = 0 ]; then
+    printf 'not used in the last hour'
+  else
+    printf 'project untouched for %s+ days' "$PROJECT_DAYS"
+  fi
+}
+
+# Lists every folder the node, rust, cpp, python and worktrees sections look at,
+# walking the search folders once per run.
+scan() {
+  [ -n "$SCAN_LIST" ] && return
+  SCAN_LIST="$(mktemp "${TMPDIR:-/tmp}/freespace.XXXXXX")"
+  local modcache ex prune
+  modcache="$(go env GOMODCACHE 2>/dev/null)"
+  prune=(-path "$HOME/go/pkg" -o -path "${modcache:-/nonexistent}")
+  for ex in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
+    prune+=(-o -path "$ex")
+  done
+  find ${SCAN_DIRS[@]+"${SCAN_DIRS[@]}"} \( "${prune[@]}" \) -prune -o \
+    -type d -name .git -print -prune -o \
+    -type d \( -name node_modules -o -name .next -o -name .open-next -o -name .turbo \
+    -o -name target -o -name 'cmake-build-*' -o -name meson-private \
+    -o -name .venv -o -name venv -o -name __pycache__ -o -name .pytest_cache \
+    -o -name .mypy_cache -o -name .ruff_cache -o -name .tox -o -name .nox \) -print -prune -o \
+    -type f -name CMakeCache.txt -print 2>/dev/null >"$SCAN_LIST"
+}
+
+clean_claude_tmp() {
+  [ -d "$CLAUDE_TMP" ] || return
+  local project session d id builds_kb
+  # Project folders are named after the encoded project path, e.g. -Users-me-code.
+  for project in "$CLAUDE_TMP"/-*/; do
+    for session in "$project"*-*-*-*-*/; do
+      [ -d "$session" ] || continue
+      session="${session%/}"
+      id="$(basename "$session")"
+      if [ -z "$(find "$session" -maxdepth 2 \( -mtime -"$DAYS" -o -mmin -60 \) -print -quit 2>/dev/null)" ]; then
+        measure "$session"
+        take "$session" "session $id, untouched for $DAYS+ days"
+        continue
+      fi
+      # Recent session: keep it, but drop Xcode build folders idle for an hour.
+      builds_kb=0
+      for d in "$session"/scratchpad/*/; do
+        d="${d%/}"
+        [ -d "$d/Build/Intermediates.noindex" ] || [ -d "$d/ModuleCache.noindex" ] || continue
+        if recently_used "$d"; then
+          note "kept, in use: Xcode build folder $id/scratchpad/$(basename "$d")"
+          continue
+        fi
+        measure "$d"
+        builds_kb=$((builds_kb + KB))
+        take "$d" "Xcode build folder $id/scratchpad/$(basename "$d")"
+      done
+      if [ "$APPLY" = 0 ] && [ -z "$(find "$session" -maxdepth 2 -mmin -60 -print -quit 2>/dev/null)" ]; then
+        measure "$session"
+        extra days $((KB - builds_kb))
+      fi
+    done
+  done
+}
+
+clean_go_cache() {
+  command -v go >/dev/null || return
+  local dir
+  dir="$(go env GOCACHE 2>/dev/null)"
+  [ -d "$dir" ] && sized "$dir" || return
+  take_cmd "$(tilde "$dir")" go clean -cache
+}
+
+clean_jetbrains() {
+  local base names name product newest
+  for base in "$HOME/Library/Caches/JetBrains" "$HOME/Library/Logs/JetBrains" "$HOME/.cache/JetBrains"; do
+    [ -d "$base" ] || continue
+    # Version folders look like GoLand2026.1. Keep the newest one per product.
+    names="$(ls -1 "$base" | grep -E '^[A-Za-z]+[0-9]{4}\.[0-9]+$' | sort)"
+    for name in $names; do
+      product="${name%%[0-9][0-9][0-9][0-9].*}"
+      newest="$(printf '%s\n' $names | grep -E "^${product}[0-9]{4}\.[0-9]+$" | tail -1)"
+      [ "$name" = "$newest" ] && continue
+      sized "$base/$name" || continue
+      take "$base/$name" "$(tilde "$base/$name") (replaced by $newest)"
+    done
+  done
+}
+
+# brew_kb: what brew cleanup --prune=all says it would free, in KB.
+brew_kb() {
+  brew cleanup --prune=all --dry-run 2>/dev/null |
+    awk '/would free approximately/ {
+      v = $0; sub(/.*approximately /, "", v); sub(/ .*/, "", v)
+      n = v + 0; u = v; gsub(/[0-9.]/, "", u)
+      m = 1 / 1024
+      if (u == "KB") m = 1; else if (u == "MB") m = 1024; else if (u == "GB") m = 1048576; else if (u == "TB") m = 1073741824
+      printf "%d", n * m
+    }'
+}
+
+clean_packages() {
+  local dir
+  if command -v bun >/dev/null && sized "$HOME/.bun/install/cache"; then
+    take_cmd "bun cache" bun pm cache rm
+  fi
+  if command -v yarn >/dev/null; then
+    dir="$(yarn cache dir 2>/dev/null)"
+    if [ -d "$dir" ] && sized "$dir"; then
+      take_cmd "yarn cache" yarn cache clean
+    fi
+  fi
+  if command -v npm >/dev/null && sized "$HOME/.npm"; then
+    take_cmd "npm cache, including npx downloads" npm cache clean --force
+    [ -d "$HOME/.npm/_npx" ] && remove "$HOME/.npm/_npx"
+  fi
+  if command -v pnpm >/dev/null; then
+    note "pnpm store: removes packages no project uses (not counted)"
+    run pnpm store prune
+  fi
+  if command -v brew >/dev/null; then
+    set_kb "$(brew_kb)"
+    if [ "$KB" -ge 1024 ]; then
+      take_cmd "Homebrew downloads and old versions of installed formulae" brew cleanup --prune=all
+    fi
+  fi
+}
+
+clean_node() {
+  scan
+  local p project cache_kb kept=0
+  while IFS= read -r p; do
+    project="$(dirname "$p")"
+    [ -f "$project/package.json" ] || continue
+    case "$(basename "$p")" in
+      .next | .open-next | .turbo)
+        if recently_used "$p"; then
+          kept=$((kept + 1))
+          continue
+        fi
+        sized "$p" || continue
+        take "$p"
+        ;;
+      node_modules)
+        if project_active "$project" "$p"; then
+          kept=$((kept + 1))
+          cache_kb=0
+          if [ -d "$p/.cache" ] && ! recently_used "$p/.cache" && sized "$p/.cache"; then
+            cache_kb=$KB
+            take "$p/.cache"
+          fi
+          kept_project "$project" "$p" "$cache_kb"
+          continue
+        fi
+        sized "$p" || continue
+        take "$p" "$(tilde "$p") ($(idle_reason))"
+        ;;
+    esac
+  done <"$SCAN_LIST"
+  [ "$kept" = 0 ] || note "kept $kept folders in use now or in projects changed in the last $PROJECT_DAYS days"
+}
+
+clean_rust() {
+  scan
+  local p project kept=0
+  while IFS= read -r p; do
+    [ "$(basename "$p")" = target ] || continue
+    project="$(dirname "$p")"
+    [ -f "$project/Cargo.toml" ] || continue
+    [ -f "$p/CACHEDIR.TAG" ] || [ -f "$p/.rustc_info.json" ] || continue
+    if project_active "$project" "$p"; then
+      kept=$((kept + 1))
+      kept_project "$project" "$p"
+      continue
+    fi
+    sized "$p" || continue
+    take "$p" "$(tilde "$p") ($(idle_reason))"
+  done <"$SCAN_LIST"
+  [ "$kept" = 0 ] || note "kept $kept target folders in projects changed in the last $PROJECT_DAYS days"
+
+  if pgrep -x cargo >/dev/null; then
+    note "cargo is running, its unpacked sources were kept"
+    return
+  fi
+  for p in "$HOME/.cargo/registry/src" "$HOME/.cargo/git/checkouts"; do
+    [ -d "$p" ] && sized "$p" || continue
+    take "$p" "$(tilde "$p") (cargo unpacks it again from its local cache)"
+  done
+}
+
+clean_cpp() {
+  scan
+  local p dir project up nested kept=0
+  while IFS= read -r p; do
+    case "$(basename "$p")" in
+      cmake-build-*)
+        dir="$p"
+        project="$(dirname "$p")"
+        [ -f "$project/CMakeLists.txt" ] || continue
+        ;;
+      meson-private)
+        dir="$(dirname "$p")"
+        project="$(dirname "$dir")"
+        ;;
+      CMakeCache.txt)
+        dir="$(dirname "$p")"
+        project="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$p" | head -1)"
+        [ -d "$project" ] || project="$(dirname "$dir")"
+        # Skip builds nested inside another build folder; the outer one covers them.
+        up="$(dirname "$dir")"
+        nested=0
+        while [ "$up" != / ] && [ "$up" != "$HOME" ]; do
+          [ -f "$up/CMakeCache.txt" ] && { nested=1; break; }
+          up="$(dirname "$up")"
+        done
+        [ "$nested" = 0 ] || continue
+        ;;
+      *) continue ;;
+    esac
+    # An in-source build lives in the project itself, so it is never removed.
+    if [ -f "$dir/CMakeLists.txt" ] || [ -f "$dir/meson.build" ] || [ -e "$dir/.git" ] ||
+      [ -n "$(git -C "$dir" ls-files 2>/dev/null | head -1)" ]; then
+      continue
+    fi
+    if project_active "$project" "$dir"; then
+      kept=$((kept + 1))
+      kept_project "$project" "$dir"
+      continue
+    fi
+    sized "$dir" || continue
+    take "$dir" "$(tilde "$dir") ($(idle_reason))"
+  done <"$SCAN_LIST"
+  [ "$kept" = 0 ] || note "kept $kept build folders in projects changed in the last $PROJECT_DAYS days"
+
+  if command -v ccache >/dev/null; then
+    p="$(ccache --get-config cache_dir 2>/dev/null)"
+    if [ -d "$p" ] && sized "$p"; then
+      take_cmd "ccache" ccache --clear
+    fi
+  fi
+}
+
+clean_python() {
+  scan
+  local p project dir kept=0 small=()
+  while IFS= read -r p; do
+    project="$(dirname "$p")"
+    case "$(basename "$p")" in
+      .venv | venv)
+        [ -f "$p/pyvenv.cfg" ] || continue
+        # Only environments the project can rebuild from its own dependency list.
+        [ -f "$project/pyproject.toml" ] || [ -f "$project/uv.lock" ] || [ -f "$project/Pipfile" ] ||
+          [ -f "$project/setup.py" ] || ls "$project"/requirements*.txt >/dev/null 2>&1 || continue
+        if project_active "$project" "$p"; then
+          kept=$((kept + 1))
+          kept_project "$project" "$p"
+          continue
+        fi
+        sized "$p" || continue
+        take "$p" "$(tilde "$p") ($(idle_reason))"
+        ;;
+      # Python rewrites bytecode it cannot find, so these go even while in use.
+      __pycache__) small+=("$p") ;;
+      .pytest_cache | .mypy_cache | .ruff_cache | .tox | .nox)
+        recently_used "$p" && continue
+        if sized "$p"; then
+          take "$p"
+        else
+          small+=("$p")
+        fi
+        ;;
+    esac
+  done <"$SCAN_LIST"
+  [ "$kept" = 0 ] || note "kept $kept virtual environments in projects changed in the last $PROJECT_DAYS days"
+  if [ "${#small[@]}" -gt 0 ]; then
+    set_kb "$(total_kb "${small[@]}")"
+    note "$SIZE  ${#small[@]} __pycache__ and small tool cache folders"
+    TOTAL_KB=$((TOTAL_KB + KB))
+    remove "${small[@]}"
+  fi
+
+  if have_python && python3 -m pip --version >/dev/null 2>&1; then
+    dir="$(python3 -m pip cache dir 2>/dev/null)"
+    if [ -d "$dir" ] && sized "$dir"; then
+      take_cmd "pip cache" python3 -m pip cache purge
+    fi
+  fi
+  if command -v uv >/dev/null; then
+    dir="$(uv cache dir 2>/dev/null)"
+    if [ -d "$dir" ] && sized "$dir"; then
+      take_cmd "uv cache" uv cache clean
+    fi
+  fi
+  if command -v poetry >/dev/null; then
+    dir="$(poetry config cache-dir 2>/dev/null)"
+    for p in "$dir/cache" "$dir/artifacts"; do
+      [ -d "$p" ] && sized "$p" || continue
+      take "$p" "$(tilde "$p") (poetry downloads; its virtualenvs are kept)"
+    done
+  fi
+  if command -v conda >/dev/null; then
+    note "conda package cache (not counted)"
+    run conda clean --all --yes
+  fi
+  if [ -d "$HOME/.cache/pre-commit" ] && sized "$HOME/.cache/pre-commit"; then
+    take "$HOME/.cache/pre-commit" "pre-commit hook environments (reinstalled on the next commit)"
+  fi
+}
+
+# docker_kb TYPE: what docker system df says TYPE could give back, in KB.
+docker_kb() {
+  docker system df --format '{{.Type}}|{{.Reclaimable}}' 2>/dev/null |
+    awk -F'|' -v t="$1" '$1 == t {
+      v = $2; sub(/ .*/, "", v)
+      n = v + 0; u = v; gsub(/[0-9.]/, "", u)
+      m = 1
+      if (u == "kB" || u == "KB") m = 1e3; else if (u == "MB") m = 1e6; else if (u == "GB") m = 1e9; else if (u == "TB") m = 1e12
+      printf "%d", n * m / 1024
+    }'
+}
+
+clean_docker() {
+  command -v docker >/dev/null || return
+  if ! docker info >/dev/null 2>&1; then
+    note "Docker is not running, skipped"
+    return
+  fi
+  local images containers unused
+  set_kb "$(docker_kb "Build Cache")"
+  take_cmd "Docker build cache" docker builder prune --all --force
+  note "dangling images, untagged layers left by rebuilds (not counted)"
+  run docker image prune --force
+  images="$(docker_kb Images)"
+  containers="$(docker_kb Containers)"
+  unused=$((${images:-0} + ${containers:-0}))
+  if [ "$DOCKER_ALL" = 1 ]; then
+    set_kb "$unused"
+    take_cmd "images no container uses, and stopped containers" docker container prune --force
+    run docker image prune --all --force
+    run docker network prune --force
+  else
+    note "kept: $(human_kb "$unused") in images no container uses and stopped containers (--docker-all removes them)"
+    extra docker-all "$unused"
+  fi
+  note "kept: all volumes"
+}
+
+clean_xcode() {
+  xcrun --find simctl >/dev/null 2>&1 || return
+  if pgrep -x xcodebuild >/dev/null; then
+    note "xcodebuild is running, skipped so its build and tests keep their files"
+    return
+  fi
+  local clones="$HOME/Library/Developer/XCTestDevices" dd="$HOME/Library/Developer/Xcode/DerivedData" d
+  local empties=() builds=()
+  if [ -d "$clones" ] && [ -n "$(ls -A "$clones")" ]; then
+    note "$(ls "$clones" | wc -l | tr -d ' ') simulator clones in $(tilde "$clones") (not counted, du over-reports them)"
+    run xcrun simctl --set testing delete all
+    # simctl leaves empty device folders behind.
+    for d in "$clones"/*/; do
+      d="${d%/}"
+      [ -d "$d" ] && ! has_files "$d" && empties+=("$d")
+    done
+    [ "${#empties[@]}" -gt 0 ] && remove "${empties[@]}"
+  fi
+  if [ -d "$dd" ]; then
+    for d in "$dd"/*/; do
+      [ -d "$d" ] && builds+=("${d%/}")
+    done
+    if [ "${#builds[@]}" -gt 0 ] && sized "$dd"; then
+      note "$SIZE  ${#builds[@]} build folders in $(tilde "$dd")"
+      TOTAL_KB=$((TOTAL_KB + KB))
+      remove "${builds[@]}"
+    fi
+  fi
+  run xcrun simctl delete unavailable
+}
+
+clean_old_ios() {
+  xcrun --find simctl >/dev/null 2>&1 || return
+  local rows id version deletable key bytes state udids newest=0 major
+  rows="$(xcrun simctl runtime list -j 2>/dev/null | python3 -c '
+import json, sys
+for r in json.load(sys.stdin).values():
+    if r.get("platformIdentifier") == "com.apple.platform.iphonesimulator":
+        print(r["identifier"], r["version"], str(r.get("deletable", False)).lower(),
+              r.get("runtimeIdentifier") or "-", r.get("sizeBytes") or 0, r.get("state") or "-")
+')"
+  [ -n "$rows" ] || return
+
+  if [ -z "$MIN_IOS" ]; then
+    # Count what keeping only the newest iOS version would free.
+    while read -r id version deletable key bytes state; do
+      major="${version%%.*}"
+      [ "$major" -gt "$newest" ] 2>/dev/null && newest="$major"
+    done <<EOF
+$rows
+EOF
+    while read -r id version deletable key bytes state; do
+      [ "${version%%.*}" -lt "$newest" ] 2>/dev/null && [ "$deletable" = true ] && extra min-ios $((bytes / 1024))
+    done <<EOF
+$rows
+EOF
+    if [ "$EXTRA_IOS_KB" -gt 0 ]; then
+      EXTRA_IOS_FLAG="--min-ios $newest"
+      note "kept: $(human_kb "$EXTRA_IOS_KB") in iOS runtimes older than iOS $newest (--min-ios $newest removes them)"
+    fi
+    return
+  fi
+
+  while read -r id version deletable key bytes state; do
+    [ -n "$id" ] || continue
+    [ "${version%%.*}" -lt "$MIN_IOS" ] 2>/dev/null || continue
+    udids="$(xcrun simctl list devices -j | python3 -c '
+import json, sys
+for d in json.load(sys.stdin)["devices"].get(sys.argv[1], []):
+    print(d["udid"])
+' "$key")"
+    if [ -n "$udids" ]; then
+      note "$(echo "$udids" | wc -l | tr -d ' ') simulators on iOS $version"
+      run xcrun simctl delete $udids
+    fi
+    if [ "$deletable" = true ]; then
+      set_kb $((bytes / 1024))
+      take_cmd "iOS $version runtime ($state)" xcrun simctl runtime delete "$id"
+    else
+      note "kept: the iOS $version runtime ships inside Xcode and simctl cannot delete it"
+    fi
+  done <<EOF
+$rows
+EOF
+}
+
+default_branch() {
+  local b
+  b="$(git -C "$1" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"
+  b="${b#origin/}"
+  if [ -z "$b" ]; then
+    for b in main master; do
+      git -C "$1" show-ref --verify --quiet "refs/heads/$b" && break
+      b=""
+    done
+  fi
+  printf '%s' "$b"
+}
+
+# Prints a worktree's uncommitted changes, ignoring Finder's .DS_Store files.
+# Returns 2 when git cannot read the worktree (a stale .git link).
+wt_changes() {
+  local out
+  out="$(git -C "$1" status --porcelain 2>/dev/null)" || return 2
+  printf '%s\n' "$out" | grep -v -e '\.DS_Store$' -e '^$'
+  return 0
+}
+
+handle_worktree() {
+  local repo="$1" base="$2" wt="$3" branch="$4" detached="$5" locked="$6" label changes rc admin kind
+  label="$(tilde "$wt")"
+  [ -d "$wt" ] || { note "$label: folder is gone, its git record gets pruned"; return; }
+  [ "$locked" = 1 ] && { note "kept $label: locked"; return; }
+
+  changes="$(wt_changes "$wt")"
+  rc=$?
+  if [ "$rc" != 0 ] && [ "$APPLY" = 1 ]; then
+    # The repo moved after the worktree was made, so the worktree's .git link is stale.
+    git -C "$repo" worktree repair "$wt" >/dev/null 2>&1
+    changes="$(wt_changes "$wt")"
+    rc=$?
+  fi
+  if [ "$rc" != 0 ]; then
+    note "kept $label: stale .git link (--apply repairs it and checks again)"
+    return
+  fi
+  [ -z "$changes" ] || { note "kept $label: uncommitted changes"; return; }
+
+  if [ "$detached" = 1 ]; then
+    if git -C "$repo" merge-base --is-ancestor "$(git -C "$wt" rev-parse HEAD)" "$base"; then
+      kind=merged
+    else
+      note "kept $label: detached at a commit that is not in $base"
+      return
+    fi
+  elif [ "$branch" = "$base" ]; then
+    note "kept $label: holds $base itself"
+    return
+  elif git -C "$repo" merge-base --is-ancestor "$branch" "$base"; then
+    kind=merged
+  else
+    kind=unmerged
+  fi
+
+  # A commit, checkout or new branch moves HEAD; status checks do not.
+  admin="$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null)"
+  if [ -n "$(find "$admin/HEAD" "$admin/logs/HEAD" \( -mtime -"$DAYS" -o -mmin -60 \) 2>/dev/null)" ]; then
+    note "kept $label: used in the last $DAYS days"
+    if [ "$APPLY" = 0 ] && [ -z "$(find "$admin/HEAD" "$admin/logs/HEAD" -mmin -60 2>/dev/null)" ]; then
+      measure "$wt"
+      if [ "$kind" = merged ]; then extra days "$KB"; else extra include-unmerged "$KB"; fi
+    fi
+    return
+  fi
+
+  if [ "$kind" = merged ]; then
+    measure "$wt"
+    if [ "$detached" = 1 ]; then
+      take_cmd "$label (detached at a commit already in $base)" git -C "$repo" worktree remove --force "$wt"
+    else
+      take_cmd "$label ($branch, merged into $base)" git -C "$repo" worktree remove --force "$wt" &&
+        run git -C "$repo" branch -d "$branch"
+    fi
+  elif [ "$INCLUDE_UNMERGED" = 1 ]; then
+    measure "$wt"
+    take_cmd "$label ($branch, not merged: removing the folder, keeping the branch)" \
+      git -C "$repo" worktree remove --force "$wt"
+    note "  bring it back with: git -C $(tilde "$repo") worktree add $(tilde "$wt") $branch"
+  else
+    note "kept $label ($branch): not merged into $base (--include-unmerged removes the folder and keeps the branch)"
+    if [ "$APPLY" = 0 ]; then
+      measure "$wt"
+      extra include-unmerged "$KB"
+    fi
+  fi
+}
+
+clean_repo_worktrees() {
+  local repo="$1" base line wt="" branch="" detached=0 locked=0 first=1 d
+  # Repos with no commits yet have nothing to clean.
+  git -C "$repo" rev-parse --verify --quiet HEAD >/dev/null || return 0
+  base="$(default_branch "$repo")"
+
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) wt="${line#worktree }"; branch=""; detached=0; locked=0 ;;
+      "branch refs/heads/"*) branch="${line#branch refs/heads/}" ;;
+      detached) detached=1 ;;
+      locked*) locked=1 ;;
+      "")
+        # The first record is the main checkout.
+        if [ "$first" = 1 ]; then
+          first=0
+        elif [ -n "$wt" ] && [ -z "$base" ]; then
+          note "kept $(tilde "$wt"): $(tilde "$repo") has no main or master branch to compare with"
+        elif [ -n "$wt" ]; then
+          handle_worktree "$repo" "$base" "$wt" "$branch" "$detached" "$locked"
+        fi
+        wt=""
+        ;;
+    esac
+  done < <(git -C "$repo" worktree list --porcelain; echo)
+
+  if git -C "$repo" worktree list --porcelain | grep -q '^prunable'; then
+    run git -C "$repo" worktree prune
+  fi
+
+  # Folders in .worktrees that git no longer tracks, left by earlier cleanups.
+  for d in "$repo"/.worktrees/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"
+    git -C "$repo" worktree list --porcelain | grep -qxF "worktree $d" && continue
+    if has_files "$d"; then
+      note "kept $(tilde "$d"): not a worktree, but has files"
+    else
+      note "empty leftover folder $(tilde "$d")"
+      remove "$d"
+    fi
+  done
+}
+
+clean_worktrees() {
+  command -v git >/dev/null || return
+  scan
+  local p d depth
+  while IFS= read -r p; do
+    case "$p" in */.git) clean_repo_worktrees "$(dirname "$p")" ;; esac
+  done <"$SCAN_LIST"
+
+  # Empty <project>/<worktree> folders that tools left after deleting worktrees
+  # they made outside the repos. Only these two levels, never inside a worktree.
+  [ -d "$TOOL_WORKTREES" ] || return
+  for depth in 2 1; do
+    while IFS= read -r d; do
+      note "empty folder $(tilde "$d")"
+      remove "$d"
+    done < <(find "$TOOL_WORKTREES" -mindepth "$depth" -maxdepth "$depth" -type d -empty 2>/dev/null)
+  done
+}
+
+# Prints the dry run's totals: this run, then each option that would free more.
+print_totals() {
+  local all s skipped=""
+  all=$((TOTAL_KB + EXTRA_PROJECT_KB + EXTRA_DAYS_KB + EXTRA_UNMERGED_KB + EXTRA_DOCKER_KB + EXTRA_IOS_KB))
+  printf '\n\033[1m%s\033[0m\n' "Total"
+  printf '  %s  this run frees with --apply\n' "$(human_kb "$TOTAL_KB")"
+  if [ "$all" -gt "$TOTAL_KB" ]; then
+    printf '  %s  with every option on:\n' "$(human_kb "$all")"
+    [ "$EXTRA_PROJECT_KB" = 0 ] || printf '    +%s  --project-days 0\n' "$(human_kb "$EXTRA_PROJECT_KB")"
+    [ "$EXTRA_DAYS_KB" = 0 ] || printf '    +%s  --days 0\n' "$(human_kb "$EXTRA_DAYS_KB")"
+    [ "$EXTRA_UNMERGED_KB" = 0 ] || printf '    +%s  --include-unmerged\n' "$(human_kb "$EXTRA_UNMERGED_KB")"
+    [ "$EXTRA_DOCKER_KB" = 0 ] || printf '    +%s  --docker-all\n' "$(human_kb "$EXTRA_DOCKER_KB")"
+    [ "$EXTRA_IOS_KB" = 0 ] || printf '    +%s  %s\n' "$(human_kb "$EXTRA_IOS_KB")" "$EXTRA_IOS_FLAG"
+  fi
+  for s in $SECTIONS; do
+    wanted "$s" || skipped="$skipped $s"
+  done
+  [ -z "$skipped" ] || printf '  Sections not run, so not counted:%s\n' "$skipped"
+  printf '  Simulator clones, the pnpm store, conda and dangling Docker images are not counted.\n'
+}
+
+if [ "$APPLY" = 1 ]; then
+  echo "Freeing storage. Free space now: $(human_kb "$(free_kb)")"
+else
+  echo "Dry run, nothing is deleted. Lines that start with a size are what --apply removes."
+fi
+before="$(free_kb)"
+
+section claude-tmp "Claude Code temp folders ($CLAUDE_TMP)" clean_claude_tmp
+section go-cache "Go build cache" clean_go_cache
+section jetbrains "Old JetBrains IDE caches and logs" clean_jetbrains
+section packages "Package manager caches" clean_packages
+section node "Node and Next build output" clean_node
+section rust "Rust builds" clean_rust
+section cpp "C and C++ builds" clean_cpp
+section python "Python caches and virtual environments" clean_python
+section docker "Docker" clean_docker
+section xcode "Xcode test clones, DerivedData, unavailable simulators" clean_xcode
+section old-ios "Old iOS simulator runtimes" clean_old_ios
+section worktrees "Git worktrees" clean_worktrees
+
+if [ "$APPLY" = 1 ]; then
+  after="$(free_kb)"
+  echo
+  echo "Free space: $(human_kb "$before") -> $(human_kb "$after") (freed $(human_kb $((after - before))))"
+  echo "Deleted simulator runtimes free their space in the background, so check again in a few minutes."
+else
+  print_totals
+  echo
+  echo "Dry run finished. Re-run with --apply to free the space."
+fi
