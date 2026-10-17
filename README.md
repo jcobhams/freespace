@@ -7,12 +7,28 @@ It shows what it would remove before it removes anything. A plain `freespace` is
 ## Install
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/jcobhams/freespace/master/install.sh | bash
+```
+
+This downloads freespace into `~/.local/share/freespace` and links the `freespace` command into `~/.local/bin`. It also links the agent skill into every AI coding agent it finds, as described in [Use it from an AI agent](#use-it-from-an-ai-agent). Run the same command again to update.
+
+To uninstall:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jcobhams/freespace/master/install.sh | bash -s -- --uninstall
+```
+
+`FREESPACE_BIN` changes where the command goes, `FREESPACE_HOME` changes where the download goes, and `FREESPACE_REF` installs a branch or tag other than `master`. The installer never replaces a folder it didn't create.
+
+If you'd rather work from a clone, run the installer from it. The links then point into the clone, so `git pull` updates them:
+
+```bash
 git clone https://github.com/jcobhams/freespace.git
 cd freespace
 ./install.sh
 ```
 
-`install.sh` links the `freespace` command into `~/.local/bin` (set `FREESPACE_BIN` for another folder). It also links the agent skill into every AI coding agent it finds, as described in [Use it from an AI agent](#use-it-from-an-ai-agent). Both are symlinks into the clone, so `git pull` updates them. `./install.sh --uninstall` removes them. You can also skip the installer and run `./freespace` from the clone.
+You can also skip the installer and run `./freespace` from the clone.
 
 It needs macOS and git. It runs on the bash that ships with macOS. Each section checks for its tool first, so one you don't use (Docker, Rust, Xcode) skips itself.
 
@@ -56,7 +72,7 @@ After `--apply` it prints your free space before and after.
 
 `skills/freespace` is an [Agent Skill](https://agentskills.io): a folder with a `SKILL.md` that tells a coding agent when and how to run `freespace`. Once it's installed, you can ask your agent things like "why is my disk full?" or "free up some space". The skill tells the agent to run a dry run first, show you the total, and only run `--apply` after you say yes.
 
-`./install.sh` links it for every agent it finds:
+The installer links it for every agent it finds:
 
 | Agent | Skill folder |
 |---|---|
@@ -64,11 +80,7 @@ After `--apply` it prints your free space before and after.
 | Codex, Gemini CLI | `~/.agents/skills/freespace` |
 | Grok | `~/.grok/skills/freespace` |
 
-To install it by hand, or for another agent that reads Agent Skills, link the folder into that agent's skills folder:
-
-```bash
-ln -s "$PWD/skills/freespace" ~/.claude/skills/freespace
-```
+To add it to another agent that reads Agent Skills, link `~/.local/share/freespace/skills/freespace` into the skills folder that agent's docs name, as a folder called `freespace`. From a clone, link `skills/freespace` inside the clone instead.
 
 Copy it with `cp -RL` instead of `cp -R` if you'd rather not link it. The skill's `scripts/freespace` is a link to the script at the top of the repo, and `-L` copies the real file. Start a new agent session afterwards so it picks the skill up.
 
