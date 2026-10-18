@@ -37,10 +37,19 @@ It needs macOS and git. It runs on the bash that ships with macOS. Each section 
 ```bash
 freespace                      # dry run: what would go, and how big it is
 freespace --apply              # remove it
+freespace --ask                # go through it item by item, asking before each one
 freespace --only node,python   # just these sections
 freespace --skip docker,xcode  # everything except these
 freespace --help               # all sections and options
 ```
+
+To choose what goes, pick sections with `--only` and `--skip`, and folders with `--scan` and `--exclude`. For example, this removes one old project's `node_modules` and nothing else:
+
+```bash
+freespace --only node --scan ~/code/old-project --project-days 0 --apply
+```
+
+`--ask` lets you decide item by item instead. It shows each item with its size and asks before removing it. Enter keeps it, so nothing goes unless you type `y`.
 
 In a dry run, a line that starts with a size is something `--apply` removes. Lines that start with "kept" explain what it left alone and why. Commands it would run are shown as `would run:`.
 
@@ -76,7 +85,7 @@ The installer links it for every agent it finds:
 
 | Agent | Skill folder |
 |---|---|
-| Claude Code | `~/.claude/skills/freespace` |
+| Claude Code | `~/.claude/skills/freespace`, and `$CLAUDE_CONFIG_DIR/skills/freespace` when that is set |
 | Codex, Gemini CLI | `~/.agents/skills/freespace` |
 | Grok | `~/.grok/skills/freespace` |
 
@@ -105,7 +114,7 @@ Copy it with `cp -RL` instead of `cp -R` if you'd rather not link it. The skill'
 
 ## How it stays safe
 
-- Nothing is deleted without `--apply`, and the config file can't turn `--apply` on.
+- Nothing is deleted without `--apply` or `--ask`, and the config file can't turn either on.
 - It only deletes inside your home folder and the Claude Code temp folder.
 - Build output written in the last hour is kept, so a running dev server or build keeps its files.
 - `node_modules`, Rust `target/` folders, C++ build folders and virtual environments are only removed from projects with no file changes in 14 days (`--project-days`).
@@ -127,6 +136,7 @@ Copy it with `cp -RL` instead of `cp -R` if you'd rather not link it. The skill'
 | Option | Default | What it does |
 |---|---|---|
 | `--apply` | off | Remove things instead of listing them |
+| `--ask` | off | Like `--apply`, but asks before each item. `y` removes it, Enter or `n` keeps it, `s` keeps the rest of that section, `q` stops |
 | `--only a,b` | all | Run only these sections |
 | `--skip a,b` | none | Run every section except these |
 | `--days N` | 2 | How long a Claude Code session or a worktree must sit unused |

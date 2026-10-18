@@ -18,7 +18,7 @@ description: Frees disk space on macOS by clearing caches and build output that 
 4. Tell the user the current free space and the total. Name the five biggest items, plus anything they may care about, such as `node_modules` in projects they use, git worktrees, virtual environments or Docker images.
 5. Ask before removing anything. Only run `--apply` after the user says yes, and use the same options as the dry run: `scripts/freespace --apply`. It prints free space before and after; report that line.
 
-Use `--only a,b` or `--skip a,b` when the user wants part of it. The sections are `claude-tmp`, `go-cache`, `jetbrains`, `packages`, `node`, `rust`, `cpp`, `python`, `docker`, `xcode`, `old-ios` and `worktrees`. `scripts/freespace --help` lists what each one removes.
+When the user wants only some of it removed, narrow the run instead of deleting by hand: `--only a,b` or `--skip a,b` for sections, `--scan DIR` or `--exclude DIR` for folders. Don't use `--ask`: it prompts on the terminal for each item, and it exits when there is no terminal to answer, as when an agent runs it. Suggest the user run `freespace --ask` themselves if they want to choose item by item. The sections are `claude-tmp`, `go-cache`, `jetbrains`, `packages`, `node`, `rust`, `cpp`, `python`, `docker`, `xcode`, `old-ios` and `worktrees`. `scripts/freespace --help` lists what each one removes.
 
 ## Options
 

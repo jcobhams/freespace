@@ -3,9 +3,9 @@
 #
 # Dry run by default: lists what it would remove and how big it is, then totals what
 # this run would free and what turning on every option would add. Nothing is deleted
-# without --apply.
+# without --apply. --ask goes through each item and asks before removing it.
 #
-# Usage: freespace [--apply] [--only a,b] [--skip a,b] [--days N] [--project-days N]
+# Usage: freespace [--apply | --ask] [--only a,b] [--skip a,b] [--days N] [--project-days N]
 #                  [--min-ios N] [--include-unmerged] [--docker-all]
 #                  [--scan DIR]... [--exclude DIR]...
 #
@@ -45,9 +45,12 @@
 # --project-days to 0 drops the wait but keeps that one-hour guard. Folders under 1 MB
 # are left alone.
 #
+# --ask removes things like --apply, but asks first for each one: y removes it, Enter
+# or n keeps it, s keeps the rest of that section, q stops. It needs a terminal.
+#
 # Options you always want can go in ~/.config/freespace/options, one per line, such
-# as "--exclude ~/docker-data". Lines starting with # are ignored. --apply is not
-# allowed there, so a plain run is always a dry run.
+# as "--exclude ~/docker-data". Lines starting with # are ignored. --apply and --ask
+# are not allowed there, so a plain run is always a dry run.
 #
 # du over-reports simulator clones (APFS copies share disk blocks), so they are left
 # out of the totals, and after --apply the summary compares free space before and after.
@@ -56,6 +59,9 @@ set -uo pipefail
 
 SECTIONS="claude-tmp go-cache jetbrains packages node rust cpp python docker xcode old-ios worktrees"
 APPLY=0
+ASK=0
+# With --ask: empty, or "skip" for the rest of a section, or "quit".
+ASK_STATE=""
 DOCKER_ALL=0
 ONLY=""
 SKIP=""
@@ -109,7 +115,7 @@ if [ -f "$CONFIG" ]; then
     line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
     case "$line" in
       "" | "#"*) continue ;;
-      --apply) echo "Ignoring --apply in $CONFIG, pass it on the command line." >&2 ;;
+      --apply | --ask) echo "Ignoring $line in $CONFIG, pass it on the command line." >&2 ;;
       *" "*) config_args+=("${line%% *}" "$(printf '%s' "${line#* }" | sed 's/^[[:space:]]*//')") ;;
       *) config_args+=("$line") ;;
     esac
@@ -120,6 +126,7 @@ set -- ${config_args[@]+"${config_args[@]}"} "$@"
 while [ $# -gt 0 ]; do
   case "$1" in
     --apply) APPLY=1 ;;
+    --ask) APPLY=1; ASK=1 ;;
     --only) ONLY="${2:?--only needs a list of sections}"; shift ;;
     --skip) SKIP="${2:?--skip needs a list of sections}"; shift ;;
     --days) DAYS="${2:?--days needs a number}"; shift ;;
@@ -140,6 +147,10 @@ for n in "$DAYS" "$PROJECT_DAYS" ${MIN_IOS:+"$MIN_IOS"}; do
     '' | *[!0-9]*) echo "Expected a whole number, got: $n" >&2; exit 1 ;;
   esac
 done
+if [ "$ASK" = 1 ] && ! { : </dev/tty; } 2>/dev/null; then
+  echo "--ask needs a terminal to answer in. Use --only, --scan or --exclude to choose what goes instead." >&2
+  exit 1
+fi
 for s in $(echo "$ONLY,$SKIP" | tr ',' ' '); do
   case " $SECTIONS " in
     *" $s "*) ;;
@@ -196,6 +207,8 @@ wanted() {
 # section NAME TITLE FUNCTION: runs one section when it is wanted.
 section() {
   wanted "$1" || return 0
+  [ "$ASK_STATE" = quit ] && return 0
+  ASK_STATE=""
   printf '\n\033[1m%s\033[0m\n' "$2"
   NOTES=0
   "$3"
@@ -209,6 +222,31 @@ run() {
   else
     printf '    would run: %s\n' "$*"
   fi
+}
+
+# confirm: with --ask, asks about the item just listed. Fails when it should be kept.
+confirm() {
+  [ "$ASK" = 1 ] || return 0
+  [ -z "$ASK_STATE" ] || return 1
+  local reply
+  while :; do
+    printf '    remove? y, n, s skips the rest of this section, q stops [n]: ' >/dev/tty
+    IFS= read -r reply </dev/tty || reply=q
+    case "$reply" in
+      y | Y | yes) return 0 ;;
+      "" | n | N | no) return 1 ;;
+      s | S) ASK_STATE=skip; return 1 ;;
+      q | Q) ASK_STATE=quit; return 1 ;;
+    esac
+  done
+}
+
+# ask_run LABEL CMD...: lists LABEL, then runs CMD once confirmed.
+ask_run() {
+  local label="$1"
+  shift
+  note "$label"
+  confirm && run "$@"
 }
 
 # remove PATH...: rm -rf with --apply, but only inside the home or Claude temp folder.
@@ -228,15 +266,18 @@ remove() {
 # take PATH [LABEL]: lists PATH with the size measured last, counts it, removes it.
 take() {
   note "$SIZE  ${2:-$(tilde "$1")}"
+  confirm || return 1
   TOTAL_KB=$((TOTAL_KB + KB))
   remove "$1"
 }
 
 # take_cmd LABEL CMD...: lists LABEL with the size measured last, counts it, runs CMD.
+# Fails when --ask keeps it, so follow-up commands can be chained with &&.
 take_cmd() {
   local label="$1"
   shift
   note "$SIZE  $label"
+  confirm || return 1
   TOTAL_KB=$((TOTAL_KB + KB))
   run "$@"
 }
@@ -396,12 +437,12 @@ clean_packages() {
     fi
   fi
   if command -v npm >/dev/null && sized "$HOME/.npm"; then
-    take_cmd "npm cache, including npx downloads" npm cache clean --force
-    [ -d "$HOME/.npm/_npx" ] && remove "$HOME/.npm/_npx"
+    if take_cmd "npm cache, including npx downloads" npm cache clean --force; then
+      [ -d "$HOME/.npm/_npx" ] && remove "$HOME/.npm/_npx"
+    fi
   fi
   if command -v pnpm >/dev/null; then
-    note "pnpm store: removes packages no project uses (not counted)"
-    run pnpm store prune
+    ask_run "pnpm store: removes packages no project uses (not counted)" pnpm store prune
   fi
   if command -v brew >/dev/null; then
     set_kb "$(brew_kb)"
@@ -560,8 +601,10 @@ clean_python() {
   if [ "${#small[@]}" -gt 0 ]; then
     set_kb "$(total_kb "${small[@]}")"
     note "$SIZE  ${#small[@]} __pycache__ and small tool cache folders"
-    TOTAL_KB=$((TOTAL_KB + KB))
-    remove "${small[@]}"
+    if confirm; then
+      TOTAL_KB=$((TOTAL_KB + KB))
+      remove "${small[@]}"
+    fi
   fi
 
   if have_python && python3 -m pip --version >/dev/null 2>&1; then
@@ -584,8 +627,7 @@ clean_python() {
     done
   fi
   if command -v conda >/dev/null; then
-    note "conda package cache (not counted)"
-    run conda clean --all --yes
+    ask_run "conda package cache (not counted)" conda clean --all --yes
   fi
   if [ -d "$HOME/.cache/pre-commit" ] && sized "$HOME/.cache/pre-commit"; then
     take "$HOME/.cache/pre-commit" "pre-commit hook environments (reinstalled on the next commit)"
@@ -613,16 +655,16 @@ clean_docker() {
   local images containers unused
   set_kb "$(docker_kb "Build Cache")"
   take_cmd "Docker build cache" docker builder prune --all --force
-  note "dangling images, untagged layers left by rebuilds (not counted)"
-  run docker image prune --force
+  ask_run "dangling images, untagged layers left by rebuilds (not counted)" docker image prune --force
   images="$(docker_kb Images)"
   containers="$(docker_kb Containers)"
   unused=$((${images:-0} + ${containers:-0}))
   if [ "$DOCKER_ALL" = 1 ]; then
     set_kb "$unused"
-    take_cmd "images no container uses, and stopped containers" docker container prune --force
-    run docker image prune --all --force
-    run docker network prune --force
+    if take_cmd "images no container uses, and stopped containers" docker container prune --force; then
+      run docker image prune --all --force
+      run docker network prune --force
+    fi
   else
     note "kept: $(human_kb "$unused") in images no container uses and stopped containers (--docker-all removes them)"
     extra docker-all "$unused"
@@ -639,14 +681,15 @@ clean_xcode() {
   local clones="$HOME/Library/Developer/XCTestDevices" dd="$HOME/Library/Developer/Xcode/DerivedData" d
   local empties=() builds=()
   if [ -d "$clones" ] && [ -n "$(ls -A "$clones")" ]; then
-    note "$(ls "$clones" | wc -l | tr -d ' ') simulator clones in $(tilde "$clones") (not counted, du over-reports them)"
-    run xcrun simctl --set testing delete all
-    # simctl leaves empty device folders behind.
-    for d in "$clones"/*/; do
-      d="${d%/}"
-      [ -d "$d" ] && ! has_files "$d" && empties+=("$d")
-    done
-    [ "${#empties[@]}" -gt 0 ] && remove "${empties[@]}"
+    if ask_run "$(ls "$clones" | wc -l | tr -d ' ') simulator clones in $(tilde "$clones") (not counted, du over-reports them)" \
+      xcrun simctl --set testing delete all; then
+      # simctl leaves empty device folders behind.
+      for d in "$clones"/*/; do
+        d="${d%/}"
+        [ -d "$d" ] && ! has_files "$d" && empties+=("$d")
+      done
+      [ "${#empties[@]}" -gt 0 ] && remove "${empties[@]}"
+    fi
   fi
   if [ -d "$dd" ]; then
     for d in "$dd"/*/; do
@@ -654,11 +697,13 @@ clean_xcode() {
     done
     if [ "${#builds[@]}" -gt 0 ] && sized "$dd"; then
       note "$SIZE  ${#builds[@]} build folders in $(tilde "$dd")"
-      TOTAL_KB=$((TOTAL_KB + KB))
-      remove "${builds[@]}"
+      if confirm; then
+        TOTAL_KB=$((TOTAL_KB + KB))
+        remove "${builds[@]}"
+      fi
     fi
   fi
-  run xcrun simctl delete unavailable
+  ask_run "simulators whose iOS runtime is no longer installed" xcrun simctl delete unavailable
 }
 
 clean_old_ios() {
@@ -702,8 +747,7 @@ for d in json.load(sys.stdin)["devices"].get(sys.argv[1], []):
     print(d["udid"])
 ' "$key")"
     if [ -n "$udids" ]; then
-      note "$(echo "$udids" | wc -l | tr -d ' ') simulators on iOS $version"
-      run xcrun simctl delete $udids
+      ask_run "$(echo "$udids" | wc -l | tr -d ' ') simulators on iOS $version" xcrun simctl delete $udids
     fi
     if [ "$deletable" = true ]; then
       set_kb $((bytes / 1024))

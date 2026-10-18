@@ -10,8 +10,9 @@
 # that copy. $FREESPACE_REF picks a branch or tag (default master).
 #
 # The command goes in ~/.local/bin, or in $FREESPACE_BIN when set. The skill is
-# linked for each agent set up on this machine: Claude Code (~/.claude/skills),
-# Codex and Gemini CLI (~/.agents/skills) and Grok (~/.grok/skills).
+# linked for each agent set up on this machine: Claude Code (~/.claude/skills, and
+# $CLAUDE_CONFIG_DIR/skills when set), Codex and Gemini CLI (~/.agents/skills) and
+# Grok (~/.grok/skills).
 
 set -uo pipefail
 
@@ -41,6 +42,11 @@ main() {
   link "$uninstall" "$here/freespace" "$bin/freespace"
   if [ -d "$HOME/.claude" ]; then
     link "$uninstall" "$here/skills/freespace" "$HOME/.claude/skills/freespace"
+    found=1
+  fi
+  # Claude Code reads its config from CLAUDE_CONFIG_DIR instead when that is set.
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -d "$CLAUDE_CONFIG_DIR" ] && [ "$CLAUDE_CONFIG_DIR" != "$HOME/.claude" ]; then
+    link "$uninstall" "$here/skills/freespace" "$CLAUDE_CONFIG_DIR/skills/freespace"
     found=1
   fi
   if [ -d "$HOME/.codex" ] || [ -d "$HOME/.gemini" ] || [ -d "$HOME/.agents" ]; then
