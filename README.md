@@ -160,7 +160,7 @@ Put options you always want in `~/.config/freespace/options`, one per line. Comm
 --project-days 30
 ```
 
-`FREESPACE_CONFIG` points it at a different file.
+`FREESPACE_CONFIG` points it at a different file. Use one option per line, with its value on the same line when required. Paths may contain spaces. Invalid lines stop the run; `--apply` and `--ask` are only allowed on the command line.
 
 ## Good to know
 

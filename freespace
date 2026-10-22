@@ -113,11 +113,31 @@ config_args=()
 if [ -f "$CONFIG" ]; then
   while IFS= read -r line || [ -n "$line" ]; do
     line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-    case "$line" in
-      "" | "#"*) continue ;;
-      --apply | --ask) echo "Ignoring $line in $CONFIG, pass it on the command line." >&2 ;;
-      *" "*) config_args+=("${line%% *}" "$(printf '%s' "${line#* }" | sed 's/^[[:space:]]*//')") ;;
-      *) config_args+=("$line") ;;
+    case "$line" in "" | "#"*) continue ;; esac
+    # Validate each line before it can enter the shared CLI parser. A missing
+    # value must never consume a flag from the next line or the command line.
+    option="${line%%[[:space:]]*}"
+    value="${line#"$option"}"
+    value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//')"
+    case "$option" in
+      --include-unmerged | --docker-all)
+        [ -z "$value" ] || { echo "Invalid config line in $CONFIG: $line" >&2; exit 1; }
+        config_args+=("$option") ;;
+      --only | --skip | --days | --project-days | --min-ios | --scan | --exclude)
+        case "$value" in
+          "" | --*) echo "Missing or invalid value in $CONFIG: $line" >&2; exit 1 ;;
+        esac
+        case "$option" in
+          --scan | --exclude) ;; # Keep spaces in folder names.
+          *) case "$value" in
+               *[[:space:]]*) echo "Expected one value in $CONFIG: $line" >&2; exit 1 ;;
+             esac ;;
+        esac
+        config_args+=("$option" "$value") ;;
+      --apply | --ask)
+        echo "$option is not allowed in $CONFIG; pass it on the command line." >&2
+        exit 1 ;;
+      *) echo "Invalid config option in $CONFIG: $option" >&2; exit 1 ;;
     esac
   done <"$CONFIG"
 fi
