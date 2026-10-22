@@ -269,16 +269,48 @@ ask_run() {
   confirm && run "$@"
 }
 
-# remove PATH...: rm -rf with --apply, but only inside the home or Claude temp folder.
-# The line describing each path is printed by the caller.
+# Resolve existing files and directories, including symlinked parent directories.
+# Keep final symlinks: removing their targets would change rm's usual meaning.
+resolved_removal_path() {
+  local p="$1" parent leaf
+  while [ "$p" != / ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+  [ -e "$p" ] && [ ! -L "$p" ] || return 1
+  if [ -d "$p" ]; then
+    (CDPATH= cd -- "$p" 2>/dev/null && pwd -P)
+  else
+    parent="$(CDPATH= cd -- "$(dirname "$p")" 2>/dev/null && pwd -P)" || return 1
+    leaf="$(basename "$p")"
+    printf '%s/%s\n' "${parent%/}" "$leaf"
+  fi
+}
+
+# Strict descendants only: neither an allowed root itself nor / can be removed.
+removal_in_scope() {
+  local target="$1" home_root temp_root
+  [ "$target" != / ] || return 1
+  home_root="$(CDPATH= cd -- "$HOME" 2>/dev/null && pwd -P)" || return 1
+  temp_root="$(CDPATH= cd -- "$CLAUDE_TMP" 2>/dev/null && pwd -P)" || temp_root=""
+  [ "$target" != "$home_root" ] && [ "$target" != "$temp_root" ] || return 1
+  case "$target" in "${home_root%/}"/?*) return 0 ;; esac
+  [ -n "$temp_root" ] || return 1
+  case "$target" in "${temp_root%/}"/?*) return 0 ;; esac
+  return 1
+}
+
+# remove PATH...: check resolved containment in dry runs and again before rm.
+# Delete the checked physical path, rather than traversing the original alias.
 remove() {
-  local p
+  local p target checked
   for p in "$@"; do
-    case "$p" in
-      "$CLAUDE_TMP"/?* | "$HOME"/?*) ;;
-      *) echo "  refusing to remove $p" >&2; continue ;;
-    esac
-    [ "$APPLY" = 1 ] && rm -rf "$p"
+    target="$(resolved_removal_path "$p")" && removal_in_scope "$target" || {
+      echo "  refusing to remove $p" >&2; continue;
+    }
+    if [ "$APPLY" = 1 ]; then
+      checked="$(resolved_removal_path "$p")" && [ "$checked" = "$target" ] && removal_in_scope "$checked" || {
+        echo "  refusing to remove $p: path changed or outside allowed roots" >&2; continue;
+      }
+      rm -rf -- "$checked"
+    fi
   done
   return 0
 }
@@ -802,9 +834,38 @@ wt_changes() {
   return 0
 }
 
+# Resolve existing directories physically so aliases, .. and symlinked parents
+# cannot bypass worktree boundaries. Failure to resolve means keep the folder.
+worktree_in_scope() {
+  local target root ex allowed=0
+  target="$(CDPATH= cd -- "$1" 2>/dev/null && pwd -P)" || return 1
+  root="$(CDPATH= cd -- "$HOME" 2>/dev/null && pwd -P)" || return 1
+  case "$target" in "$root"/?*) ;; *) return 1 ;; esac
+  for ex in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
+    ex="$(CDPATH= cd -- "$ex" 2>/dev/null && pwd -P)" || continue
+    case "$target" in "$ex" | "${ex%/}"/*) return 1 ;; esac
+  done
+  for root in ${SCAN_DIRS[@]+"${SCAN_DIRS[@]}"}; do
+    root="$(CDPATH= cd -- "$root" 2>/dev/null && pwd -P)" || continue
+    case "$target" in "$root" | "${root%/}"/*) allowed=1 ;; esac
+  done
+  [ "$allowed" = 1 ]
+}
+
+# Recheck after confirmation as well as before inspecting a worktree.
+take_worktree() {
+  local label="$1" repo="$2" wt="$3"
+  note "$SIZE  $label"
+  confirm || return 1
+  worktree_in_scope "$wt" || { note "kept $(tilde "$wt"): outside cleanup scope"; return 1; }
+  TOTAL_KB=$((TOTAL_KB + KB))
+  run git -C "$repo" worktree remove --force "$wt"
+}
+
 handle_worktree() {
   local repo="$1" base="$2" wt="$3" branch="$4" detached="$5" locked="$6" label changes rc admin kind
   label="$(tilde "$wt")"
+  worktree_in_scope "$wt" || { note "kept $label: outside cleanup scope"; return; }
   [ -d "$wt" ] || { note "$label: folder is gone, its git record gets pruned"; return; }
   [ "$locked" = 1 ] && { note "kept $label: locked"; return; }
 
@@ -852,15 +913,14 @@ handle_worktree() {
   if [ "$kind" = merged ]; then
     measure "$wt"
     if [ "$detached" = 1 ]; then
-      take_cmd "$label (detached at a commit already in $base)" git -C "$repo" worktree remove --force "$wt"
+      take_worktree "$label (detached at a commit already in $base)" "$repo" "$wt"
     else
-      take_cmd "$label ($branch, merged into $base)" git -C "$repo" worktree remove --force "$wt" &&
+      take_worktree "$label ($branch, merged into $base)" "$repo" "$wt" &&
         run git -C "$repo" branch -d "$branch"
     fi
   elif [ "$INCLUDE_UNMERGED" = 1 ]; then
     measure "$wt"
-    take_cmd "$label ($branch, not merged: removing the folder, keeping the branch)" \
-      git -C "$repo" worktree remove --force "$wt"
+    take_worktree "$label ($branch, not merged: removing the folder, keeping the branch)" "$repo" "$wt" || return
     note "  bring it back with: git -C $(tilde "$repo") worktree add $(tilde "$wt") $branch"
   else
     note "kept $label ($branch): not merged into $base (--include-unmerged removes the folder and keeps the branch)"
@@ -906,11 +966,12 @@ clean_repo_worktrees() {
     [ -d "$d" ] || continue
     d="${d%/}"
     git -C "$repo" worktree list --porcelain | grep -qxF "worktree $d" && continue
+    worktree_in_scope "$d" || continue
     if has_files "$d"; then
       note "kept $(tilde "$d"): not a worktree, but has files"
     else
       note "empty leftover folder $(tilde "$d")"
-      remove "$d"
+      worktree_in_scope "$d" && remove "$d"
     fi
   done
 }
@@ -928,8 +989,9 @@ clean_worktrees() {
   [ -d "$TOOL_WORKTREES" ] || return
   for depth in 2 1; do
     while IFS= read -r d; do
+      worktree_in_scope "$d" || continue
       note "empty folder $(tilde "$d")"
-      remove "$d"
+      worktree_in_scope "$d" && remove "$d"
     done < <(find "$TOOL_WORKTREES" -mindepth "$depth" -maxdepth "$depth" -type d -empty 2>/dev/null)
   done
 }

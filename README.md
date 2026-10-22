@@ -115,9 +115,10 @@ Copy it with `cp -RL` instead of `cp -R` if you'd rather not link it. The skill'
 ## How it stays safe
 
 - Nothing is deleted without `--apply` or `--ask`, and the config file can't turn either on.
-- It only deletes inside your home folder and the Claude Code temp folder.
+- It only deletes inside your home folder and the Claude Code temp folder. It resolves parent symlinks and `..` before checking containment, then checks again before deletion. The roots themselves and final symlinks are kept.
 - Build output written in the last hour is kept, so a running dev server or build keeps its files.
 - `node_modules`, Rust `target/` folders, C++ build folders and virtual environments are only removed from projects with no file changes in 14 days (`--project-days`).
+- Worktree paths are resolved before checking them against scan roots, exclusions, and your home folder. These checks run again after confirmation, immediately before removal. The same boundaries apply to empty leftover worktree folders.
 - A worktree is only removed when all of these hold:
   - its branch is merged into the repo's `main` or `master`;
   - it has no uncommitted changes (Finder's `.DS_Store` files don't count);
